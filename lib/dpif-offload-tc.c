@@ -58,11 +58,10 @@ struct tc_flow_dump_thread {
     bool netdev_dump_done;
     size_t netdev_dump_index;
 
-    /* (Flows/Key/Mask/Actions) Buffers for netdev dumping. */
+    /* Netlink flows, and per batch slot a flow's actions, key and mask. */
     struct ofpbuf nl_flows;
-    struct odputil_keybuf keybuf[FLOW_DUMP_MAX_BATCH];
-    struct odputil_keybuf maskbuf[FLOW_DUMP_MAX_BATCH];
-    struct odputil_keybuf actbuf[FLOW_DUMP_MAX_BATCH];
+    struct odputil_keybuf buf_stub[FLOW_DUMP_MAX_BATCH][3];
+    struct ofpbuf buf[FLOW_DUMP_MAX_BATCH];
 };
 
 static struct tc_offload *
@@ -317,8 +316,8 @@ tc_flow_dump_create(const struct dpif_offload *offload, bool terse)
 }
 
 static int
-tc_match_to_dpif_flow(struct match *match, struct ofpbuf *key_buf,
-                      struct ofpbuf *mask_buf, struct nlattr *actions,
+tc_match_to_dpif_flow(struct match *match, struct ofpbuf *buf,
+                      struct nlattr *actions,
                       struct dpif_flow_stats *stats,
                       struct dpif_flow_attrs *attrs, ovs_u128 *ufid,
                       struct dpif_flow *flow, bool terse)
@@ -338,24 +337,28 @@ tc_match_to_dpif_flow(struct match *match, struct ofpbuf *key_buf,
                 .ct_label = true,
             },
         };
-        size_t offset;
+        size_t act_ofs, key_ofs, mask_ofs;
+        struct ofpbuf key;
 
-        /* Key */
-        offset = key_buf->size;
-        flow->key = ofpbuf_tail(key_buf);
-        odp_flow_key_from_flow(&odp_parms, key_buf);
-        flow->key_len = key_buf->size - offset;
-
-        /* Mask */
-        offset = mask_buf->size;
-        flow->mask = ofpbuf_tail(mask_buf);
-        odp_parms.key_buf = key_buf;
-        odp_flow_key_from_mask(&odp_parms, mask_buf);
-        flow->mask_len = mask_buf->size - offset;
-
-        /* Actions */
-        flow->actions = nl_attr_get(actions);
+        act_ofs = (char *) nl_attr_get(actions) - (char *) buf->data;
         flow->actions_len = nl_attr_get_size(actions);
+
+        key_ofs = buf->size;
+        odp_flow_key_from_flow(&odp_parms, buf);
+        flow->key_len = buf->size - key_ofs;
+
+        /* The mask is built while reading 'key', so 'buf' must not move. */
+        ofpbuf_prealloc_tailroom(buf, ODPUTIL_FLOW_KEY_BYTES);
+        ofpbuf_use_const(&key, ofpbuf_at_assert(buf, key_ofs, flow->key_len),
+                         flow->key_len);
+        odp_parms.key_buf = &key;
+        mask_ofs = buf->size;
+        odp_flow_key_from_mask(&odp_parms, buf);
+        flow->mask_len = buf->size - mask_ofs;
+
+        flow->actions = ofpbuf_at_assert(buf, act_ofs, flow->actions_len);
+        flow->key = ofpbuf_at_assert(buf, key_ofs, flow->key_len);
+        flow->mask = ofpbuf_at_assert(buf, mask_ofs, flow->mask_len);
     }
 
     /* Stats */
@@ -411,13 +414,10 @@ tc_flow_dump_next(struct dpif_offload_flow_dump_thread *thread_,
     max_flows = MIN(max_flows, FLOW_DUMP_MAX_BATCH);
 
     while (!thread->netdev_dump_done && n_flows < max_flows) {
-        struct odputil_keybuf *maskbuf = &thread->maskbuf[n_flows];
-        struct odputil_keybuf *keybuf = &thread->keybuf[n_flows];
-        struct odputil_keybuf *actbuf = &thread->actbuf[n_flows];
+        struct ofpbuf *buf = &thread->buf[n_flows];
         struct netdev_tc_flow_dump *netdev_dump;
         struct dpif_flow *f = &flows[n_flows];
         int cur = thread->netdev_dump_index;
-        struct ofpbuf key, mask, act;
         struct dpif_flow_stats stats;
         struct dpif_flow_attrs attrs;
         struct nlattr *actions;
@@ -426,15 +426,13 @@ tc_flow_dump_next(struct dpif_offload_flow_dump_thread *thread_,
         bool has_next;
 
         netdev_dump = thread->dump->netdev_dumps[cur];
-        ofpbuf_use_stack(&key, keybuf, sizeof *keybuf);
-        ofpbuf_use_stack(&act, actbuf, sizeof *actbuf);
-        ofpbuf_use_stack(&mask, maskbuf, sizeof *maskbuf);
+        ofpbuf_clear(buf);
         has_next = tc_netdev_flow_dump_next(netdev_dump, &match, &actions,
                                             &stats, &attrs, &ufid,
-                                            &thread->nl_flows, &act);
+                                            &thread->nl_flows, buf);
         if (has_next) {
-            tc_match_to_dpif_flow(&match, &key, &mask, actions, &stats,
-                                  &attrs, &ufid, f, thread->dump->dump.terse);
+            tc_match_to_dpif_flow(&match, buf, actions, &stats, &attrs, &ufid,
+                                  f, thread->dump->dump.terse);
             n_flows++;
         } else {
             tc_advance_provider_dump(thread);
@@ -473,6 +471,10 @@ tc_flow_dump_thread_create(struct dpif_offload_flow_dump *dump)
     thread->netdev_dump_index = 0;
     thread->netdev_dump_done = !thread->dump->netdev_dump_count;
     ofpbuf_init(&thread->nl_flows, NL_DUMP_BUFSIZE);
+    for (int i = 0; i < FLOW_DUMP_MAX_BATCH; i++) {
+        ofpbuf_use_stub(&thread->buf[i], thread->buf_stub[i],
+                        sizeof thread->buf_stub[i]);
+    }
     return &thread->thread;
 }
 
@@ -481,6 +483,9 @@ tc_flow_dump_thread_destroy(struct dpif_offload_flow_dump_thread *thread_)
 {
     struct tc_flow_dump_thread *thread = tc_flow_dump_thread_cast(thread_);
 
+    for (int i = 0; i < FLOW_DUMP_MAX_BATCH; i++) {
+        ofpbuf_uninit(&thread->buf[i]);
+    }
     ofpbuf_uninit(&thread->nl_flows);
     free(thread);
 }
@@ -616,23 +621,15 @@ tc_parse_flow_get(struct tc_offload *offload_tc, struct dpif_flow_get *get)
 {
     struct dpif_flow *dpif_flow = get->flow;
     struct dpif_offload_port *port;
-    struct odputil_keybuf maskbuf;
-    struct odputil_keybuf keybuf;
-    struct odputil_keybuf actbuf;
-    struct ofpbuf key, mask, act;
     struct dpif_flow_stats stats;
     struct dpif_flow_attrs attrs;
-    uint64_t act_buf[1024 / 8];
     struct nlattr *actions;
     struct match match;
-    struct ofpbuf buf;
     int err = ENOENT;
-
-    ofpbuf_use_stack(&buf, &act_buf, sizeof act_buf);
 
     DPIF_OFFLOAD_PORT_FOR_EACH (port, &offload_tc->offload) {
         if (!tc_netdev_flow_get(port->netdev, &match, &actions, get->ufid,
-                                &stats, &attrs, &buf)) {
+                                &stats, &attrs, get->buffer)) {
             err = 0;
             break;
         }
@@ -644,15 +641,8 @@ tc_parse_flow_get(struct tc_offload *offload_tc, struct dpif_flow_get *get)
 
     VLOG_DBG("found flow from netdev, translating to dpif flow");
 
-    ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);
-    ofpbuf_use_stack(&act, &actbuf, sizeof actbuf);
-    ofpbuf_use_stack(&mask, &maskbuf, sizeof maskbuf);
-    tc_match_to_dpif_flow(&match, &key, &mask, actions, &stats, &attrs,
+    tc_match_to_dpif_flow(&match, get->buffer, actions, &stats, &attrs,
                           (ovs_u128 *) get->ufid, dpif_flow, false);
-    ofpbuf_put(get->buffer, nl_attr_get(actions), nl_attr_get_size(actions));
-    dpif_flow->actions = ofpbuf_at(get->buffer, 0, 0);
-    dpif_flow->actions_len = nl_attr_get_size(actions);
-
     return 0;
 }
 
