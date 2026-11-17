@@ -1896,19 +1896,19 @@ ukey_create_from_dpif_flow(const struct udpif *udpif,
     uint64_t stub[DPIF_FLOW_BUFSIZE / 8];
     const struct nlattr *a;
     unsigned int left;
+    struct ofpbuf buf;
+    int err = 0;
+
+    ofpbuf_use_stub(&buf, &stub, sizeof stub);
 
     if (!flow->key_len || !flow->actions_len) {
-        struct ofpbuf buf;
-        int err;
-
         /* If the key or actions were not provided by the datapath, fetch the
          * full flow. */
-        ofpbuf_use_stack(&buf, &stub, sizeof stub);
         err = dpif_flow_get(udpif->dpif, flow->key, flow->key_len,
                             flow->ufid_present ? &flow->ufid : NULL,
                             flow->pmd_id, &buf, &full_flow);
         if (err) {
-            return err;
+            goto out;
         }
         flow = &full_flow;
     }
@@ -1920,12 +1920,14 @@ ukey_create_from_dpif_flow(const struct udpif *udpif,
     NL_ATTR_FOR_EACH (a, left, flow->key, flow->key_len) {
         if (nl_attr_type(a) == OVS_KEY_ATTR_RECIRC_ID
             && nl_attr_get_u32(a) != 0) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
     }
     NL_ATTR_FOR_EACH (a, left, flow->actions, flow->actions_len) {
         if (nl_attr_type(a) == OVS_ACTION_ATTR_RECIRC) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
     }
 
@@ -1936,7 +1938,9 @@ ukey_create_from_dpif_flow(const struct udpif *udpif,
                           &flow->ufid, flow->pmd_id, &actions,
                           reval_seq, flow->stats.used, 0, NULL);
 
-    return 0;
+out:
+    ofpbuf_uninit(&buf);
+    return err;
 }
 
 static bool
